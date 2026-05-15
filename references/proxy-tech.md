@@ -105,3 +105,18 @@ proxy update  # 强制刷新订阅
 | 9090 | 控制面板 API |
 
 检查端口：`ss -tlnp | grep mihomo`
+
+## GitHub 仓库页面坑
+
+若 GitHub 仓库页面显示为空（No files/folders），但 API 显示有内容：
+
+```bash
+# 错误信号：API 返回 size: 0
+curl -s "https://api.github.com/repos/<user>/<repo>" | python3 -c "import sys,json; print(json.load(sys.stdin).get('size'))"
+
+# 正确验证：用 raw URL 取文件内容
+curl -s "https://raw.githubusercontent.com/<user>/<repo>/main/scripts/proxy.sh" | head -5
+```
+
+**原因**：GitHub 页面缓存延迟，新建的空仓库或刚 push 的内容可能几秒内不显示。
+**解法**：强制刷新 `Ctrl+Shift+R`，或等 30 秒后重试，或直接给用户 raw URL 验货。

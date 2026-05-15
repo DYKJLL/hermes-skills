@@ -1,4 +1,4 @@
-name: hermes-proxy
+name: 网络代理
 description: |
   WSL/ Linux 网络代理技能。基于 mihomo（Clash.Meta）实现。
   mihomo 运行于本机 7897 端口作为 SOCKS/HTTP 代理，配合规则分流。
