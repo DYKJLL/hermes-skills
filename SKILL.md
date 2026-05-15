@@ -54,6 +54,8 @@ usage: |
 
 ## 安装
 
+> **源码仓库**: https://github.com/DYKJLL/hermes-proxy
+
 ### 1. 安装 mihomo
 
 ```bash
