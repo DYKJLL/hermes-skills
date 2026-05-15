@@ -1,0 +1,14 @@
+name: 网络代理
+description: |
+  WSL/ Linux 网络代理技能。基于 mihomo（Clash.Meta）实现。
+  mihomo 运行于本机 7897 端口作为 SOCKS/HTTP 代理，配合规则分流。
+  GitHub/Google 等国外流量走代理，国内（GEOIP CN）直连。
+  通过订阅链接自动维护节点列表，支持一键启动/切换/测速。
+category: 网络
+triggers:
+  - 代理
+  - proxy
+  - 网络代理
+  - 翻墙
+  - 节点
+  - 科学上网
