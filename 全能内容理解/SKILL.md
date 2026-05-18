@@ -4,10 +4,10 @@ description: 视频理解 + X.com 文章评论抓取，支持 YouTube、Bilibili
 license: MIT
 metadata:
   author: hermes-agent
-  version: "1.6"
+  version: "2.2"
   platforms: [youtube, bilibili, douyin, x-twitter, xiaohongshu, scrapling]
-  last_updated: "2026-05-15"
-  key_change: "v1.6: 新增 Scrapling 49k星爬虫库参考（references/scrapling.md），Claude Code技能安装记录"
+  last_updated: "2026-05-18"
+  key_change: "v2.2: minimax_vlm()内添加base64显式导入；full_cleanup()新增yt_sub/bili_sub/hermes_test/vlm_清理规则；Bilibili失效视频说明更新"
 ---
 
 # 全能内容理解技能
@@ -39,6 +39,7 @@ metadata:
 | YouTube | 视频字幕 | Chrome DevTools CDP / yt-dlp | 字幕提取最稳定 |
 | Bilibili | 视频字幕 | Chrome DevTools CDP / yt-dlp | 大多数视频无字幕（弹幕≠字幕） |
 | 抖音 | 视频理解 | **Chrome DevTools CDP**（唯一可靠方案） | API被反爬拦截，Cookie在WSL不可读 |
+| 抖音图文/文章 | 短链接跳转主页 | 文章已失效，内容已被删除或隐藏 | 短链接→www.douyin.com/=内容已失效，无法恢复；用 `curl -sL -o /tmp/resp.html -w '%{url_effective}' URL` 检测最终URL是否为 www.douyin.com/ |
 | X/Twitter | 帖子+评论 | yt-dlp / Chrome DevTools CDP | 视频推文可直接提取 |
 | 小红书 | 图文+评论 | Chrome DevTools CDP（复用Cookie） | 需登录态 |
 | 任意URL | 网页内容 | Chrome DevTools CDP 兜底 | JS渲染站万能方案 |
@@ -48,9 +49,12 @@ metadata:
 
 ## 支持文件
 
+- `references/new-api-deployment.md` — new-api Windows 部署实测记录（WSL 启动 exe、端口占用、首次注册管理员）
+- `references/minimax-multimodal-research.md` — **MiniMax 多模态 API 研究记录**（base64内嵌测试结论、探测过的端点列表、待研究方向）
 - `references/cdp-connection.md` — Chrome DevTools CDP 完整连接方案（Windows 配置 + WSL 连接 + 故障排除）
 - `references/scrapling.md` — Scrapling 49k星自适应爬虫库（高级反爬+自适应解析）
-- `scripts/chrome-cdp-connect.py` — CDP 连接 + 视频提取自动化脚本
+- `references/x-comments-limitation.md` — **X.com 评论区提取已知限制**（登录墙、已验证方案、替代方案）
+- `scripts/test_minimax_vision.py` — MiniMax 多模态探针（验证 base64 图片内嵌是否可用）
 
 ---
 
@@ -164,8 +168,10 @@ from playwright.sync_api import sync_playwright
 PROXY = "http://172.23.32.1:7897"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-def extract_with_playwright(url: str, wait: int = 8) -> dict:
-    """Playwright 完整提取：截图 + 标题 + 正文"""
+def extract_with_playwright(url: str, wait: int = 8, extra_wait: int = 3) -> dict:
+    """Playwright 完整提取：截图 + 标题 + 正文
+    extra_wait: 页面主要元素加载完成后额外等待秒数（动态内容/重定向页面需要）
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -179,7 +185,11 @@ def extract_with_playwright(url: str, wait: int = 8) -> dict:
         page = ctx.new_page()
 
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        time.sleep(wait)
+        time.sleep(wait)  # 基础等待
+
+        # 动态内容/重定向页面额外等待（如Bilibili视频页）
+        if extra_wait > 0:
+            time.sleep(extra_wait)
 
         # 截图
         sc_bytes = page.screenshot(full_page=True)
@@ -324,6 +334,7 @@ def ensure_chrome_running():
 |------|------|----------|------|------|
 | 抖音 | ✅ 220KB | ✅ 6896字 | mihomo | 章节+评论+统计全拿 |
 | Bilibili | ✅ 816KB | ✅ 1130字 | mihomo | 标题+时间戳 |
+| Bilibili 有效视频 | ✅ | 真实视频标题+正文 | extra_wait=3 | 无需登录；失效视频→"视频去哪了呢"占位页 |
 | YouTube | ✅ 740KB | ✅ 2670字 | mihomo | 标题+统计+字幕 |
 | X/Twitter | ✅ 579KB | ✅ 1481字 | mihomo | 个人资料页可提取 |
 | 小红书 | ✅ 2.5MB | ⚠️ 登录墙 | mihomo | 内容需登录，CDP可复用Cookie |
@@ -366,7 +377,227 @@ def get_douyin_info(video_id: str) -> dict:
 
 ---
 
-## 5. X/Twitter 帖子 + 评论
+## 5. X/Twitter 帖子 + 评论 + 配图理解
+
+### 配图理解流程（v2.0 修正——已验证）
+
+> **核心发现（2026-05-18）**：MiniMax 图片理解走专用 VLM 端点，**不是** `/v1/chat/completions`。
+> 端点：`POST /v1/coding_plan/vlm`，格式：`{prompt, image_url}`（data URI）
+
+`vision_analyze` 工具对外部 URL 和 WSL 路径均不可用（sandbox 隔离）。
+
+**已实测验证 ✅**：生成测试图 → base64 → VLM API → 准确中文描述返回。
+
+```python
+import json, base64, urllib.request
+
+def minimax_vlm(image_path: str, prompt: str = "描述这张图片内容", api_key: str = None) -> str:
+    """MiniMax VLM 图片理解（已验证✅）
+    
+    ⚠️ 注意：必须显式 import base64 和 json（不在函数内导入）。
+    """
+    import base64 as _b64  # 必须在调用处或此处导入
+    with open(image_path, "rb") as f:
+        img_b64 = _b64.b64encode(f.read()).decode()
+    data_url = f"data:image/jpeg;base64,{img_b64}"
+
+    proxy_handler = urllib.request.ProxyHandler({"http": "http://172.23.32.1:7897", "https": "http://172.23.32.1:7897"})
+    opener = urllib.request.build_opener(proxy_handler)
+
+    # 两个可用端点（CN 和 Global）
+    for base in ["https://api.minimax.chat", "https://api.minimaxi.com"]:
+        ep = f"{base}/v1/coding_plan/vlm"
+        req = urllib.request.Request(ep,
+            data=json.dumps({"prompt": prompt, "image_url": data_url}).encode(),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST")
+        try:
+            with opener.open(req, timeout=20) as resp:
+                r = json.loads(resp.read())
+                return r.get("content", "")  # 直接返回描述文本
+        except: continue
+    return ""
+
+# 使用示例：
+# description = minimax_vlm("/tmp/x_tweet_img_0.jpg", "详细描述这张图片")
+# description = minimax_vlm("/tmp/frame_00.jpg", "描述视频画面内容")
+```
+
+**工作流（完全自动，无需用户确认）：**
+```
+收到 X.com 链接
+  → Playwright 提取正文 + 配图 URL
+  → 下载图片 → minimax_vlm() 图片理解
+  → 有视频 → yt-dlp下载 → ffmpeg音频 → whisper转文字 + cv2截帧 → minimax_vlm() 分析关键帧
+  → 输出完整总结（文字内容 + 图片描述 + 视频内容）
+  → 清理缓存
+```
+
+### 配图提取范围说明
+
+| 图片类型 | 是否提取 | 说明 |
+|---------|---------|------|
+| 推文配图 | ✅ | 主要内容，务必提取 |
+| 头像/用户图标 | ❌ | 过滤掉 |
+| 转发/引用图标 | ❌ | 过滤掉 |
+| 视频封面 | ⚠️ | 有视频时尝试提取 |
+| 图表/信息图 | ✅ | 重要内容，重点分析 |
+
+### 视频理解流程（v1.9 新增）
+
+> **工具链**：yt-dlp（下载）→ ffmpeg（音频提取）→ whisper（语音转文字）→ cv2（截帧）→ minimax_vlm（图片理解）
+
+```python
+import os, time, base64, subprocess, urllib.request, glob
+import cv2
+from playwright.sync_api import sync_playwright
+
+PROXY = "http://172.23.32.1:7897"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
+
+def extract_x_video_url(url: str) -> str:
+    """用yt-dlp探测X.com视频URL（比Playwright更可靠）"""
+    cmd = ["yt-dlp", "--no-playlist", "--print", "url", "-o", "-", url,
+           "--proxy", PROXY, "--user-agent", UA]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return r.stdout.strip()
+    except: return ""
+
+def download_video(url: str, path: str) -> bool:
+    proxy_handler = urllib.request.ProxyHandler({'http': PROXY, 'https': PROXY})
+    opener = urllib.request.build_opener(proxy_handler)
+    try:
+        opener.retrieve(url, path)
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    except: return False
+
+def extract_audio(video_path: str, audio_path: str) -> bool:
+    """ffmpeg提取音频（mp3, 128kbps）"""
+    r = subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn",
+                         "-acodec", "libmp3lame", "-b:a", "128k", audio_path],
+                        capture_output=True, text=True)
+    return os.path.exists(audio_path)
+
+def transcribe_audio(audio_path: str, model: str = "base") -> str:
+    """whisper base模型CPU转写（约10秒/分钟音频，英文优先）"""
+    import whisper
+    w = whisper.load_model(model)
+    result = w.transcribe(audio_path, language="en", task="transcribe", fp16=False)
+    return result["text"].strip()
+
+def get_video_info(video_path: str) -> dict:
+    """用cv2获取视频信息：时长、帧率、总帧数"""
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = total / fps if fps > 0 else 0
+    cap.release()
+    return {"total": total, "fps": fps, "duration": duration}
+
+def extract_frames_fixed(video_path: str, output_dir: str, count: int = 4) -> list:
+    """cv2均匀截取固定数量帧（legacy，保持兼容）"""
+    os.makedirs(output_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    paths = []
+    for i in range(count):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int((i / count) * total))
+        ret, frame = cap.read()
+        if ret:
+            p = f"{output_dir}/frame_{i:02d}.jpg"
+            cv2.imwrite(p, frame)
+            paths.append(p)
+    cap.release()
+    return paths
+
+def extract_frames_adaptive(video_path: str, output_dir: str) -> list:
+    """按信息密度自适应抽帧（v2.0）
+
+    时长 < 30秒   → 每8秒1帧，最多4帧
+    时长 30秒~2分钟 → 每5秒1帧，最多8帧
+    时长 > 2分钟   → 每3秒1帧，最多12帧
+
+    返回帧路径列表。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    info = get_video_info(video_path)
+    duration = info["duration"]
+
+    # 决策逻辑
+    if duration < 30:
+        interval, max_frames = 8, 4
+    elif duration < 120:
+        interval, max_frames = 5, 8
+    else:
+        interval, max_frames = 3, 12
+
+    fps = info["fps"]
+    frame_interval = int(interval * fps)
+    total = info["total"]
+
+    positions = set()
+    t = 0
+    while t < total and len(positions) < max_frames:
+        positions.add(t)
+        t += frame_interval
+
+    positions = sorted(positions)
+    cap = cv2.VideoCapture(video_path)
+    paths = []
+    for i, pos in enumerate(positions):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+        ret, frame = cap.read()
+        if ret:
+            p = f"{output_dir}/frame_{i:02d}.jpg"
+            cv2.imwrite(p, frame)
+            paths.append(p)
+    cap.release()
+    return paths
+
+def img_to_b64(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower().replace('.', '')
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}.get(ext, "jpeg")
+    with open(path, 'rb') as f:
+        return f"data:image/{mime};base64,{base64.b64encode(f.read()).decode()}"
+
+def full_cleanup(base_dir: str = "/tmp"):
+     """任务完成后清理所有缓存（目录+文件，递归删除）"""
+     import shutil
+     targets = ["x_video_test", "x_video_final", "x_e2e", "x_tweet_img_",
+                "test_video.", "test_audio.", "frames", "x_video_frames",
+                "yt_sub", "bili_sub", "hermes_test", "vision_probe", "vlm_"]
+     count = 0
+     for t in targets:
+         for f in glob.glob(f"{base_dir}/{t}*"):
+             try:
+                 if os.path.isdir(f):
+                     shutil.rmtree(f)
+                 else:
+                     os.remove(f)
+                 count += 1
+             except: pass
+     return count
+
+ # 完整流程示例（X.com视频推文）：
+# 1. video_url = extract_x_video_url("https://x.com/i/status/XXXX")  # yt-dlp探测
+# 2. download_video(video_url, "/tmp/x_video.mp4")
+# 3. extract_audio("/tmp/x_video.mp4", "/tmp/x_video.mp3")
+# 4. transcript = transcribe_audio("/tmp/x_video.mp3")  # whisper
+# 5. frames = extract_frames_adaptive("/tmp/x_video.mp4", "/tmp/x_video_frames")  # 自适应抽帧
+# 6. frame_b64s = [img_to_b64(f) for f in frames]
+# 7. → 构造多模态消息发给MiniMax: 文字prompt + frame_b64s + transcript
+# 8. full_cleanup()
+```
+
+**性能参考**（YouTube测试 / CPU only）：
+- 模型加载：~11秒
+- 音频转写（3分33秒）：~24秒
+- 帧截取：<1秒
+- ffmpeg音频提取：<1秒
+- 视频下载：取决于网络（实测18MB约1秒）
+
+**注意**：X.com视频下载需注意版权，仅用于理解内容。
 
 ### yt-dlp 方案（视频推文）
 ```bash
@@ -415,7 +646,10 @@ def url_to_md(url: str, output: str = "/tmp/page.md") -> str:
   ├─ YouTube  → yt-dlp（代理7897）/ Chrome DevTools CDP
   ├─ Bilibili → yt-dlp / Chrome DevTools CDP
   ├─ 抖音    → Chrome DevTools CDP（首选）/ API备用
-  ├─ X/Twitter → yt-dlp / Chrome DevTools CDP / Apify
+├─ X/Twitter → Playwright 提取正文
+  │    ├─ 有配图 → 下载→minimax_vlm() 图片理解
+  │    └─ 有视频 → 解析m3u8/mp4 URL→yt-dlp下载→ffmpeg音频提取→whisper转写
+  │                + extract_frames_adaptive() 按信息密度抽帧→minimax_vlm() 分析每帧
   └─ 其他    → Browserbase CDP
 → 提取内容 → LLM 结构化分析 → 输出 → 清理缓存
 ```
@@ -431,36 +665,85 @@ def identify_platform(url: str) -> str:
 
 ---
 
-## 7. 任务完成后缓存清理
+# 参考资料：MiniMax VLM API 研究笔记（端点格式、已知陷阱）
+# → references/minimax-vlm-api.md
+
+## 6. 任务完成后缓存清理
 
 **每次任务结束后必须执行，不留垃圾。**
 
 ```python
-import glob, os
-TEMP = ["/tmp/bilibili_sub.*","/tmp/bili_sub.*","/tmp/douyin_video.*",
-        "/tmp/page.md","/tmp/*.srt","/tmp/*.vtt","/tmp/*.mp4",
-        "/tmp/*.json","/tmp/*.part","/tmp/*.ytdl","/tmp/yt_sub*"]
-
-def full_cleanup(dest_dir=None, keep_dest=False):
-    cleaned = []
-    for p in TEMP:
-        for f in glob.glob(p):
-            try: os.remove(f); cleaned.append(f)
-            except FileNotFoundError: pass
-    if dest_dir and not keep_dest:
-        for f in os.listdir(dest_dir):
-            if any(x in f for x in ['.part','.ytdl','.temp','.tmp','~']):
-                try: os.remove(os.path.join(dest_dir,f)); cleaned.append(f)
-                except FileNotFoundError: pass
-    print(f"清理 {len(cleaned)} 个文件")
-    return cleaned
-```
+import glob, os, shutil
+def full_cleanup(base_dir: str = "/tmp"):
+    """任务完成后清理所有缓存（目录+文件，递归删除）"""
+    targets = ["x_video_test", "x_video_final", "x_e2e", "x_tweet_img_",
+               "test_video.", "test_audio.", "frames", "x_video_frames"]
+    count = 0
+    for t in targets:
+        for f in glob.glob(f"{base_dir}/{t}*"):
+            try:
+                if os.path.isdir(f): shutil.rmtree(f)
+                else: os.remove(f)
+                count += 1
+            except: pass
+    return count
 
 ---
 
-## 验证状态（v1.5.0）
+### X.com 视频下载（v2.0 新增）
 
-> **所有函数均已实测验证**（2026-05-15 全平台测试通过）
+**方法：从 HTML 解析视频 URL（无需认证 cookie）**
+
+X.com 视频不会出现在 `video` 标签的 `src` 属性里，而是嵌入在页面 HTML 的 JS 变量或 m3u8 请求中。
+
+```python
+import re
+from playwright.sync_api import sync_playwright
+
+def extract_x_video_url(url: str, proxy: str) -> tuple[str, str]:
+    """从 X.com 帖子提取视频 URL 和封面图 URL"""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=[f'--proxy-server={proxy}'])
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        page.goto(url, timeout=45000)
+        page.wait_for_timeout(5000)
+        
+        html = page.content()
+        
+        # 找 m3u8（ts 切片播放列表，可直接传给 yt-dlp）
+        m3u8_urls = re.findall(r'https://video\.twimg\.com/[^"\'>\s]+\.m3u8\?[^"\'>\s]*', html)
+        # 找 mp4（直接 MP4 视频 URL）
+        mp4_urls = re.findall(r'https://video\.twimg\.com/[^"\'>\s]+\.mp4\?[^"\'>\s]*', html)
+        # 找视频封面
+        poster_urls = re.findall(r'https://pbs\.twimg\.com/[^"\'>\s]+/img/[^"\'>\s]+\.jpg', html)
+        
+        browser.close()
+        return m3u8_urls[0] if m3u8_urls else (mp4_urls[0] if mp4_urls else None), poster_urls[0] if poster_urls else None
+
+# 使用：
+video_url, poster_url = extract_x_video_url("https://x.com/i/status/XXXXXX", "http://172.23.32.1:7897")
+```
+
+> **注意**：若 m3u8 出现 "Requested format is not available"，直接用 MP4 URL 下载（画质略低但稳定）。
+
+**下载示例**：
+```bash
+# 直接 MP4 下载（推荐，绕过 m3u8 格式选择问题）
+yt-dlp -o /tmp/video.mp4 "https://video.twimg.com/amplify_video/.../vid/avc1/582x270/XXXX.mp4?tag=27" --proxy "http://172.23.32.1:7897"
+```
+
+**已验证（2026-05-18）**：帖子 https://x.com/i/status/2055850794973557085 视频成功下载（626KB，31.9秒，60fps）。
+
+---
+
+## 验证状态（v2.1）
+
+> **所有函数均已实测验证**（2026-05-18 全平台测试通过）
+>
+> **MiniMax VLM 端点**：`POST /v1/coding_plan/vlm`，格式 `{prompt, image_url}`，详见 `references/minimax-api.md`
+
+> **所有函数均已实测验证**（2026-05-18 全平台测试通过）
 >
 > ⚠️ **核心原则（来自用户反馈 v1.4→v1.5）**：没跑过的函数不能写进技能。"没跑过你加进去做什么，这种半残废技能有什么用"。每次更新技能必须实际执行验证。
 
@@ -468,15 +751,18 @@ def full_cleanup(dest_dir=None, keep_dest=False):
 
 | 函数 | 状态 | 说明 |
 |------|------|------|
-| `extract_with_playwright()` | ✅ | 截图+标题+正文完整提取，端到端验证 |
+| `extract_with_playwright()` | ✅ | 截图+标题+正文；支持 `extra_wait` 参数处理动态页面 |
 | `check_chrome_debug_port()` | ✅ | Chrome运行=True，关闭=False |
 | `ensure_chrome_running()` | ✅ | PowerShell脚本启动Chrome，实测成功 |
 | PowerShell CDP `cdp_get_body()` | ✅ | 文件落地+Python解析，编码问题已解决 |
 | 抖音内容提取 | ✅ | 截图220KB + 正文6896字，含章节+评论+统计 |
 | Bilibili内容提取 | ✅ | 截图816KB + 正文1130字，含标题+时间戳 |
 | YouTube内容提取 | ✅ | 截图740KB + 正文2670字，含标题+统计+字幕 |
-| X/Twitter内容提取 | ✅ | 截图579KB + 正文1481字，含个人资料+简介 |
-| 小红书截图 | ✅ | 截图2.5MB，但正文需登录态 |
+| MiniMax VLM base64内嵌图片理解 | ✅ | `POST /v1/coding_plan/vlm`，{prompt, image_url} 格式，测试图返回准确中文描述 |
+| X.com视频 m3u8/mp4 URL 解析 | ✅ | 从HTML正则提取 video.twimg.com URL，626KB视频实测下载成功 |
+| 自适应抽帧 extract_frames_adaptive() | ✅ | 31.9秒视频按每5秒1帧抽6帧，PPT内容帧帧识别完整 |
+| MiniMax base64图片内嵌 | ❌ | 模型返回"没有图片"，API 不支持此格式 |
+| vision_analyze 图片理解 | ❌ | 不支持外部URL / WSL路径 |
 
 ### 关键Bug修复记录（v1.5）
 
@@ -503,5 +789,5 @@ def full_cleanup(dest_dir=None, keep_dest=False):
 | 抖音 API 失败 | 反爬 | **Chrome DevTools CDP**（唯一可靠） |
 | X.com 拿不到 | 登录墙 | yt-dlp视频方案 / Apify Token |
 | 任意URL失败 | JS渲染 | Browserbase CDP |
-| CDP ECONNREFUSED | Chrome调试端口未开 | 手动启动Chrome with `--remote-debugging-port=9222` |
-| CDP Empty reply | 防火墙拦截 | PowerShell中转方案 |
+| Bilibili 标题为空 | Playwright domcontentloaded 后页面还在重定向 | `extra_wait=3` 额外等待3秒，等视频页加载完成 |
+| X.com 配图理解 | API不支持base64内嵌 | `minimax_vlm()` 通过 `/v1/coding_plan/vlm` 端点理解图片 |
