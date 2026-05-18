@@ -4,10 +4,10 @@ description: 视频理解 + X.com 文章评论抓取，支持 YouTube、Bilibili
 license: MIT
 metadata:
   author: hermes-agent
-  version: "2.2"
-  platforms: [youtube, bilibili, douyin, x-twitter, xiaohongshu, scrapling]
-  last_updated: "2026-05-18"
-  key_change: "v2.2: minimax_vlm()内添加base64显式导入；full_cleanup()新增yt_sub/bili_sub/hermes_test/vlm_清理规则；Bilibili失效视频说明更新"
+  version: "2.3"
+  platforms: [youtube, bilibili, douyin, x-twitter, xiaohongshu, scrapling, r-jina]
+  last_updated: "2026-05-19"
+  key_change: "v2.3: 新增 r.jina.ai 轻量级网页提取（两级策略：先快后慢）；统一工作流更新"
 ---
 
 # 全能内容理解技能
@@ -42,6 +42,9 @@ metadata:
 | 抖音图文/文章 | 短链接跳转主页 | 文章已失效，内容已被删除或隐藏 | 短链接→www.douyin.com/=内容已失效，无法恢复；用 `curl -sL -o /tmp/resp.html -w '%{url_effective}' URL` 检测最终URL是否为 www.douyin.com/ |
 | X/Twitter | 帖子+评论 | yt-dlp / Chrome DevTools CDP | 视频推文可直接提取 |
 | 小红书 | 图文+评论 | Chrome DevTools CDP（复用Cookie） | 需登录态 |
+
+- `references/douyin-note-research.md` — 抖音图文帖（/note/）内容提取限制：只返回引言，GitHub链接等详情需通过评论区或GitHub搜索获取
+- `references/r-jina-实测.md` — **r.jina.ai 实测结论**（2026-05-19）：Python urllib 不稳定原因、curl 方案、500字阈值依据、平台效果表格
 | 任意URL | 网页内容 | Chrome DevTools CDP 兜底 | JS渲染站万能方案 |
 | 强反爬目标 | 动态/大规模 | **Scrapling**（49k星） | 指纹伪造+CF绕过+自适应解析 |
 
@@ -49,6 +52,7 @@ metadata:
 
 ## 支持文件
 
+- `references/bazhuayu-mcp.md` — **八爪鱼 MCP 调研**（2026-05-19）：AI 直接获取网页结构化数据，与本技能互补
 - `references/new-api-deployment.md` — new-api Windows 部署实测记录（WSL 启动 exe、端口占用、首次注册管理员）
 - `references/minimax-multimodal-research.md` — **MiniMax 多模态 API 研究记录**（base64内嵌测试结论、探测过的端点列表、待研究方向）
 - `references/cdp-connection.md` — Chrome DevTools CDP 完整连接方案（Windows 配置 + WSL 连接 + 故障排除）
@@ -621,9 +625,82 @@ def scrape_x(apify_token: str, tweet_url: str) -> dict:
 
 ---
 
-## 6. 通用 URL → Markdown（兜底）
+## 6. 通用 URL → 内容提取（两级策略）
 
-> 需要配置 `BROWSERBASE_API_KEY`
+> **轻量优先原则**：简单内容用最快的方式，需要登录/动态内容的才上重型工具。
+
+### 6.1 轻量级：r.jina.ai（第一层，1秒出结果）
+
+> **用法**：直接调 `https://r.jina.ai/<URL>`，返回 Markdown 格式网页内容。
+> 适用：新闻/博客/公众号等公开文章。登录墙/评论区/动态内容无效。
+
+```bash
+# 直接 curl 调用，返回 Markdown
+curl -sL "https://r.jina.ai/https://example.com/article"
+```
+
+```python
+import subprocess, os, re
+
+PROXY = "http://172.23.32.1:7897"
+
+def fetch_url_jina(url: str) -> str:
+    """通过 r.jina.ai 获取网页内容（Markdown格式）
+
+    ⚠️ 用 subprocess + curl，urllib 直连不稳定（403/超时）。
+    """
+    cmd = [
+        "curl", "-sL", "--max-time", "15",
+        f"https://r.jina.ai/{url}"
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    return r.stdout
+
+def fetch_url_with_fallback(url: str) -> str:
+    """两级策略：先 r.jina.ai，内容不足再上 Playwright"""
+    content = fetch_url_jina(url)
+    # 简单判断：内容太短说明可能被墙，走 Playwright
+    if len(content) > 500:
+        return content
+    # 内容不足，交给 Playwright
+    result = extract_with_playwright(url)
+    return f"## {result['title']}\n\n{result['body']}"
+```
+
+### 6.2 重型兜底：Playwright + Chrome CDP（第二层）
+
+> 内容不足时的兜底方案。能处理登录墙、动态内容、评论区等。
+
+```python
+# 见第三章 Playwright + CDP 完整方案
+```
+
+### 平台选择指南
+
+| 内容类型 | 推荐方案 | 说明 |
+|---------|---------|------|
+| 普通文章/新闻/博客 | **r.jina.ai** | 1秒出结果，不需要浏览器 |
+| 公众号文章 | **r.jina.ai** | 大多数情况够用 |
+| 登录墙/付费内容 | Playwright CDP | 复用 Chrome 登录态 |
+| 评论区 | Playwright CDP | 需要登录态 |
+| 视频页面 | Playwright CDP | 拿视频信息+描述 |
+| 复杂动态页面 | Playwright CDP | JS 渲染内容 |
+
+### 统一工作流（更新）
+
+```
+收到 URL
+  → 先试 r.jina.ai（1秒内出结果）
+  → 内容 > 500字 → 直接用 ✅
+  → 内容 ≤ 500字 → 走 Playwright CDP 兜底
+  → 提取内容 → LLM 结构化分析 → 输出
+```
+
+---
+
+## 7. 通用 URL → Markdown（Browserbase 备选）
+
+> 需要配置 `BROWSERBASE_API_KEY`，已有 r.jina.ai + Playwright 双保险时很少用到。
 
 ```python
 import subprocess, os
@@ -639,18 +716,20 @@ def url_to_md(url: str, output: str = "/tmp/page.md") -> str:
 
 ---
 
-## 统一工作流
+## 统一工作流（v2.3 两级策略）
 
 ```
-用户发链接 → 识别平台
+收到 URL → 识别平台
   ├─ YouTube  → yt-dlp（代理7897）/ Chrome DevTools CDP
   ├─ Bilibili → yt-dlp / Chrome DevTools CDP
   ├─ 抖音    → Chrome DevTools CDP（首选）/ API备用
-├─ X/Twitter → Playwright 提取正文
+  ├─ X/Twitter → Playwright 提取正文
   │    ├─ 有配图 → 下载→minimax_vlm() 图片理解
   │    └─ 有视频 → 解析m3u8/mp4 URL→yt-dlp下载→ffmpeg音频提取→whisper转写
   │                + extract_frames_adaptive() 按信息密度抽帧→minimax_vlm() 分析每帧
-  └─ 其他    → Browserbase CDP
+  └─ 其他    → r.jina.ai 轻量提取（1秒内）
+              └─ 内容 > 500字 → 直接用
+              └─ 内容 ≤ 500字 → Playwright CDP 兜底
 → 提取内容 → LLM 结构化分析 → 输出 → 清理缓存
 ```
 
